@@ -50,3 +50,6 @@ firebaseAdminCredentials*.json
 # generated native folders
 /ios
 /android
+
+# Token do Expo (build local)
+.expo-token

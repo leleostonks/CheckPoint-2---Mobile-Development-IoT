@@ -6,8 +6,9 @@ import type { ConfigContext, ExpoConfig } from 'expo/config';
  */
 const ANDROID_PACKAGE = process.env.ANDROID_PACKAGE ?? 'br.com.fiap.chatfirebase';
 const IOS_BUNDLE_ID = process.env.IOS_BUNDLE_ID ?? 'br.com.fiap.chatfirebase';
-/** Preenchido por `npx eas-cli init` (ou pela variável EAS_PROJECT_ID). */
-const EAS_PROJECT_ID = process.env.EAS_PROJECT_ID ?? '';
+/** Projeto EAS (conta leleo2). Pode ser trocado pela variável EAS_PROJECT_ID. */
+const EAS_PROJECT_ID = process.env.EAS_PROJECT_ID ?? '3797e9fb-ab9c-4429-9a59-3dababb9fe98';
+const EAS_OWNER = process.env.EAS_OWNER ?? 'leleo2';
 
 /**
  * Arquivo do app Android no Firebase (necessário para o FCM).
@@ -19,6 +20,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   ...config,
   name: 'Chat Firebase',
   slug: 'chat-firebase',
+  owner: EAS_OWNER,
   scheme: 'chatfirebase',
   version: '1.0.0',
   orientation: 'portrait',
