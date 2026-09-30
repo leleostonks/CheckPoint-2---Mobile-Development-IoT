@@ -3,7 +3,7 @@
  * Pode ser sobrescrita pela variável EXPO_PUBLIC_API_URL; o valor padrão deve apontar
  * para a API publicada, para que o app funcione sem configuração extra na correção.
  */
-const DEFAULT_API_URL = 'https://SEU-PROJETO.vercel.app';
+const DEFAULT_API_URL = 'https://check-point-2-mobile-development-io-theta.vercel.app';
 
 export const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? DEFAULT_API_URL).replace(/\/+$/, '');
 
