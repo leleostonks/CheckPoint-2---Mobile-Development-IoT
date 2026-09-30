@@ -30,8 +30,19 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files
+# local env files (os .env.example são versionados)
+.env
 .env*.local
+server/.env
+
+# Credenciais administrativas: NUNCA versionar
+serviceAccountKey*.json
+firebaseAdminCredentials*.json
+*-firebase-adminsdk-*.json
+
+# Firebase emulators / Vercel
+*-debug.log
+.vercel
 
 # typescript
 *.tsbuildinfo
