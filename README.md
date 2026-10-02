@@ -289,8 +289,6 @@ Credenciais administrativas existem **somente** nas variáveis da Vercel. `fireb
 
 ![push](docs/prints/push.png)
 
-> Substitua pelas capturas reais (pasta `docs/prints/`).
-
 ---
 
 ## ✅ Qualidade
