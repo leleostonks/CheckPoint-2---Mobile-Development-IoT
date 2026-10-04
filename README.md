@@ -17,7 +17,7 @@ Aplicativo de chat em **React Native + Expo + TypeScript** com conversas individ
 | Repositório | https://github.com/leleostonks/CheckPoint-2---Mobile-Development-IoT |
 | API online | https://check-point-2-mobile-development-io.vercel.app |
 | Health check | https://check-point-2-mobile-development-io.vercel.app/health |
-| APK Android (instalação direta) | https://expo.dev/artifacts/eas/-EvQpcg8Fc2UnGFZnmePn1-1WFHrMy4vDLj2upIn9DU.apk |
+| APK Android (instalação direta) | https://expo.dev/artifacts/eas/lJBVlV0l0i6n4it5hNPhMsF0HnK4WqSpiLBOIc7Wmio.apk |
 
 ---
 
