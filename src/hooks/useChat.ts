@@ -28,14 +28,28 @@ type UseChatResult = {
   clearSendError: () => void;
 };
 
+const LAST_MESSAGE_RETRIES = 5;
+const LAST_MESSAGE_RETRY_MS = 3000;
+
 /** Última mensagem da conversa, para a prévia na lista. Falhas silenciosas: a prévia é opcional. */
 export function useLastMessage(conversationId: string): ChatMessage | null {
   const [message, setMessage] = useState<ChatMessage | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
-    const unsubscribe = subscribeLastMessage(conversationId, setMessage, () => setMessage(null));
-    return unsubscribe;
-  }, [conversationId]);
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const unsubscribe = subscribeLastMessage(conversationId, setMessage, (error) => {
+      setMessage(null);
+      // Grupo recém-criado: o espelho de integrantes chega pela API logo depois; tenta ouvir de novo.
+      if (isPermissionDenied(error) && attempt < LAST_MESSAGE_RETRIES) {
+        retryTimer = setTimeout(() => setAttempt((value) => value + 1), LAST_MESSAGE_RETRY_MS);
+      }
+    });
+    return () => {
+      clearTimeout(retryTimer);
+      unsubscribe();
+    };
+  }, [conversationId, attempt]);
 
   return message;
 }

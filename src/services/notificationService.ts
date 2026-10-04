@@ -1,5 +1,4 @@
 import Constants from 'expo-constants';
-import * as Device from 'expo-device';
 import * as Notifications from 'expo-notifications';
 import { deleteDoc, doc, setDoc } from 'firebase/firestore';
 import { Platform } from 'react-native';
@@ -114,9 +113,6 @@ async function saveDevice(uid: string, registered: RegisteredToken): Promise<voi
 
 /** Solicita permissão, obtém o token do aparelho e o grava em `users/{uid}/devices`. */
 export async function registerDeviceForPush(uid: string): Promise<RegisteredToken> {
-  if (!Device.isDevice) {
-    throw new AppError('Notificações push exigem um dispositivo físico.');
-  }
   if (Platform.OS !== 'android' && Platform.OS !== 'ios') {
     throw new AppError('Notificações push não são suportadas nesta plataforma.');
   }

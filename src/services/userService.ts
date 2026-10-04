@@ -58,7 +58,14 @@ export function subscribeOwnProfile(
 ): Unsubscribe {
   return onSnapshot(
     userDoc(uid),
-    (snapshot: DocumentSnapshot<ChatUser>) => onChange(snapshot.exists() ? snapshot.data() : null),
+    { includeMetadataChanges: true },
+    (snapshot: DocumentSnapshot<ChatUser>) => {
+      // Sem conexão, o cache pode responder "não existe" antes do servidor; só o servidor confirma a ausência.
+      if (!snapshot.exists() && snapshot.metadata.fromCache) {
+        return;
+      }
+      onChange(snapshot.exists() ? snapshot.data() : null);
+    },
     onError,
   );
 }
