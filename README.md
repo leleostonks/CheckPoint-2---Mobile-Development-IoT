@@ -212,7 +212,7 @@ Variáveis opcionais do app: [`.env.example`](.env.example) (`EXPO_PUBLIC_API_UR
 - `google-services.json` na raiz (ou variável de arquivo `GOOGLE_SERVICES_JSON` no EAS).
 - O app cria o canal `messages` (importância alta) e pede a permissão (Android 13+).
 - O token nativo do FCM (`getDevicePushTokenAsync`) é salvo em `users/{uid}/devices`.
-- Teste em **dispositivo físico**.
+- Teste em **dispositivo físico** ou em um **emulador Android com Google Play** (imagem "Google Play").
 
 ### Notificações no iOS
 
@@ -288,6 +288,8 @@ Credenciais administrativas existem **somente** nas variáveis da Vercel. `fireb
 ### Evidência de notificação recebida
 
 ![push](docs/prints/push.png)
+
+Push real entregue pela API (FCM) com o app em segundo plano; ao tocar na notificação, o app abre a conversa correspondente.
 
 ---
 
