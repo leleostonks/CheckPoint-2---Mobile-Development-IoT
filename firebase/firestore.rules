@@ -119,6 +119,8 @@ service cloud.firestore {
         && resource.data.ownerId == request.auth.uid
         && request.resource.data.ownerId == resource.data.ownerId
         && request.resource.data.createdAt == resource.data.createdAt
+        // Remoções passam somente pela API, que pré-revoga o acesso no RTDB.
+        && request.resource.data.memberIds.hasAll(resource.data.memberIds)
         // A versão nunca pode regredir, mesmo numa edição sem troca de integrantes.
         && request.resource.data.updatedAt >= resource.data.updatedAt
         // Alterações de integrantes precisam de uma versão nova para o espelho do RTDB.
@@ -131,6 +133,11 @@ service cloud.firestore {
 
     // Controle de idempotência dos pushes: acesso exclusivo da API (Admin SDK ignora as regras).
     match /notificationDeliveries/{deliveryId} {
+      allow read, write: if false;
+    }
+
+    // Provas de conclusão das remoções: somente a API pode limpar pré-revogações com base nelas.
+    match /membershipRemovals/{operationId} {
       allow read, write: if false;
     }
   }

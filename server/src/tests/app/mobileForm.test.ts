@@ -25,7 +25,10 @@ async function form() {
         get: async () => ({ exists: () => true, data: () => stored }), update: (_ref, changes) => { stored = { ...stored, ...changes }; },
       }),
     },
-    '/firebase': { firestore: {} }, '/imageService': {}, '/apiClient': { parseOk: () => true, apiRequest: async () => true },
+    '/firebase': { firestore: {} }, '/imageService': {}, '/apiClient': { parseOk: () => true, apiRequest: async (path: string, options: { body?: { memberIds: string[] } }) => {
+      if (path.endsWith('/remove-members')) stored = { ...stored, memberIds: stored.memberIds.filter((id) => !options.body?.memberIds.includes(id)), updatedAt: Math.max(Date.now(), stored.updatedAt + 1) };
+      return true;
+    } },
   });
   const { GroupFormScreen } = loadWithMocks<{ GroupFormScreen: (props: { groupId: string }) => Element }>(join(__dirname, '../../../../src/screens/GroupFormScreen.tsx'), {
     react: harness.react, 'react/jsx-runtime': jsxRuntime,

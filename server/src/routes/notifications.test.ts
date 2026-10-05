@@ -56,7 +56,7 @@ const doubles = {
   '/firebaseAdmin': {
     adminFirestore: () => firestore,
     adminDatabase: () => ({ ref: (path: string) => ({
-      get: async () => ({ exists: () => true, val: () => message }),
+      get: async () => ({ exists: () => true, val: () => path === 'conversationMembers/g1' ? mirror : message }),
       transaction: async (update: (current: unknown) => unknown) => {
         assert.equal(path, 'conversationMembers/g1');
         const next = update(mirror); if (next !== undefined) mirror = next;

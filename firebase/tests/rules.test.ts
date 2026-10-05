@@ -14,8 +14,8 @@ import firebase from 'firebase/compat/app';
 import 'firebase/compat/database';
 import 'firebase/compat/firestore';
 
-import { adminDatabase } from '../../server/src/services/firebaseAdmin';
-import { callGroupSync, initializeDemoAdmin } from '../../server/src/tests/groupRoute';
+import { adminDatabase, adminFirestore } from '../../server/src/services/firebaseAdmin';
+import { callGroupRemove, callGroupSync, initializeDemoAdmin } from '../../server/src/tests/groupRoute';
 
 const PROJECT = join(__dirname, '..');
 let env: RulesTestEnvironment;
@@ -248,6 +248,284 @@ describe('Realtime Database: mensagens', () => {
   });
 });
 
+describe('API: remoção fail-closed de integrantes', () => {
+  const prepare = async () => {
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupSync('g1', 'alice');
+  };
+
+  it('cliente não pode remover diretamente no Firestore, mesmo sendo proprietário', async () => {
+    await prepare();
+    await assertFails(fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'carol'], updatedBy: 'alice', updatedAt: now + 2 }));
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+  });
+
+  it('revoga leitura/escrita no RTDB antes do commit Firestore e preserva versão no passo inicial', async () => {
+    await prepare();
+    const startedBefore = Date.now();
+    const database = adminFirestore(); const original = database.runTransaction.bind(database);
+    let checked = false;
+    const patched = mock.method(database, 'runTransaction', async (...args: Parameters<typeof database.runTransaction>) => {
+      const groupBefore = await fs('bob').doc('groups/g1').get(); assert.ok(groupBefore.exists);
+      await assertFails(db('bob').ref('messages/g1').get());
+      await assertFails(db('bob').ref('messages/g1/before-commit').set(message({ senderId: 'bob' })));
+      assert.equal((await db('alice').ref('conversationMembers/g1/_version').get()).val(), now + 1);
+      const pending: unknown = (await db('alice').ref('conversationMembers/g1/_removals').get()).val();
+      assert.ok(typeof pending === 'object' && pending !== null);
+      const operation: unknown = Object.values(pending)[0];
+      assert.ok(typeof operation === 'object' && operation !== null && 'startedAt' in operation);
+      assert.ok(typeof operation.startedAt === 'number' && operation.startedAt >= startedBefore && operation.startedAt <= Date.now());
+      await callGroupSync('g1', 'alice'); // Mesmo snapshot não pode desfazer a pré-revogação.
+      await assertFails(db('bob').ref('messages/g1').get());
+      checked = true; return original(...args);
+    });
+    try { await callGroupRemove('g1', 'alice', ['bob']); } finally { patched.mock.restore(); }
+    assert.equal(checked, true);
+    await assertFails(fs('bob').doc('groups/g1').get());
+    await assertFails(db('bob').ref('messages/g1').get());
+    await assertFails(db('bob').ref('messages/g1/after-commit').set(message({ senderId: 'bob' })));
+    const current = await fs('alice').doc('groups/g1').get();
+    assert.ok(current.get('updatedAt') > now + 1); assert.equal(current.get('updatedBy'), 'alice');
+  });
+
+  it('falha no commit Firestore restaura explicitamente o espelho e retorna erro', async () => {
+    await prepare();
+    const patched = mock.method(adminFirestore(), 'runTransaction', async () => {
+      await assertFails(db('bob').ref('messages/g1').get());
+      await fs('alice').doc('groups/g1').update({ name: 'Nome preservado na restauração', updatedBy: 'alice', updatedAt: now + 2 });
+      await callGroupSync('g1', 'alice');
+      await assertFails(db('bob').ref('messages/g1').get());
+      throw new Error('Commit Firestore sinteticamente indisponível');
+    });
+    try { await assert.rejects(callGroupRemove('g1', 'alice', ['bob']), /Commit Firestore/); }
+    finally { patched.mock.restore(); }
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+    await assertSucceeds(db('bob').ref('messages/g1/restored').set(message({ senderId: 'bob' })));
+    assert.deepEqual((await fs('alice').doc('groups/g1').get()).get('memberIds'), ['alice', 'bob', 'carol']);
+    assert.equal((await fs('alice').doc('groups/g1').get()).get('name'), 'Nome preservado na restauração');
+  });
+
+  it('não proprietário recebe 403 e não modifica os bancos', async () => {
+    await prepare();
+    await assert.rejects(callGroupRemove('g1', 'bob', ['carol']), (error: unknown) => typeof error === 'object' && error !== null && 'status' in error && error.status === 403);
+    await assertSucceeds(db('carol').ref('messages/g1').get());
+    assert.deepEqual((await fs('alice').doc('groups/g1').get()).get('memberIds'), ['alice', 'bob', 'carol']);
+  });
+
+  it('não permite remover proprietário nem deixar menos de dois integrantes', async () => {
+    await prepare();
+    const badRequest = (error: unknown) => typeof error === 'object' && error !== null && 'status' in error && error.status === 400;
+    await assert.rejects(callGroupRemove('g1', 'alice', ['alice']), badRequest);
+    await assert.rejects(callGroupRemove('g1', 'alice', ['bob', 'carol']), badRequest);
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+  });
+
+  it('pré-revogação do espelho legado também resiste ao sync antes do commit', async () => {
+    await prepare();
+    await env.withSecurityRulesDisabled(async (ctx) => { await ctx.database().ref('conversationMembers/g1').set({ alice: true, bob: true, carol: true }); });
+    const database = adminFirestore(); const original = database.runTransaction.bind(database);
+    const patched = mock.method(database, 'runTransaction', async (...args: Parameters<typeof database.runTransaction>) => {
+      await assertFails(db('bob').ref('messages/g1').get());
+      assert.equal((await db('alice').ref('conversationMembers/g1/_version').get()).exists(), false);
+      await callGroupSync('g1', 'alice');
+      await assertFails(db('bob').ref('messages/g1').get());
+      return original(...args);
+    });
+    try { await callGroupRemove('g1', 'alice', ['bob']); } finally { patched.mock.restore(); }
+  });
+
+  it('sync de uma edição concorrente mais nova não reabre acesso durante a remoção', async () => {
+    await prepare();
+    const database = adminFirestore(); const original = database.runTransaction.bind(database);
+    const patched = mock.method(database, 'runTransaction', async (...args: Parameters<typeof database.runTransaction>) => {
+      await assertFails(db('bob').ref('messages/g1').get());
+      await fs('alice').doc('groups/g1').update({ name: 'Edição concorrente', updatedBy: 'alice', updatedAt: now + 2 });
+      await callGroupSync('g1', 'alice');
+      await assertFails(db('bob').ref('messages/g1').get());
+      await assertFails(db('bob').ref('messages/g1/during-new-sync').set(message({ senderId: 'bob' })));
+      return original(...args);
+    });
+    try { await callGroupRemove('g1', 'alice', ['bob']); } finally { patched.mock.restore(); }
+    assert.equal((await fs('alice').doc('groups/g1').get()).get('name'), 'Edição concorrente');
+  });
+
+  it('falha do sync final mantém o removido bloqueado e permite reparo', async () => {
+    await prepare();
+    const database = adminDatabase(); const originalRef = database.ref.bind(database); let calls = 0;
+    const patched = mock.method(database, 'ref', (path?: string) => {
+      const reference = originalRef(path);
+      return new Proxy(reference, { get(target, key) {
+        const value: unknown = Reflect.get(target, key, target);
+        if (path === 'conversationMembers/g1' && key === 'transaction' && typeof value === 'function') {
+          return async (...args: unknown[]) => { if (++calls === 2) throw new Error('Sync final indisponível'); return Reflect.apply(value, target, args); };
+        }
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    });
+    try { await assert.rejects(callGroupRemove('g1', 'alice', ['bob']), /Sync final/); }
+    finally { patched.mock.restore(); }
+    await assertFails(fs('bob').doc('groups/g1').get());
+    await assertFails(db('bob').ref('messages/g1').get());
+    await assertFails(db('bob').ref('messages/g1/no-sync').set(message({ senderId: 'bob' })));
+    await callGroupSync('g1', 'alice');
+    await assertFails(db('bob').ref('messages/g1').get());
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals').get()).exists(), false);
+  });
+
+  it('duas remoções concorrentes respeitam mínimo e restauração não desfaz a bem-sucedida', async () => {
+    await prepare();
+    const results = await Promise.allSettled([callGroupRemove('g1', 'alice', ['bob']), callGroupRemove('g1', 'alice', ['carol'])]);
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    const current = await fs('alice').doc('groups/g1').get();
+    const ids: string[] = current.get('memberIds'); assert.equal(ids.length, 2);
+    for (const uid of ['bob', 'carol']) {
+      if (ids.includes(uid)) await assertSucceeds(db(uid).ref('messages/g1').get());
+      else await assertFails(db(uid).ref('messages/g1').get());
+    }
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals').get()).exists(), false);
+  });
+
+  it('conclusão de outra remoção não apaga a pré-revogação ainda em andamento', async () => {
+    await prepare();
+    const database = adminFirestore(); const original = database.runTransaction.bind(database);
+    let first = true;
+    const patched = mock.method(database, 'runTransaction', async (...args: Parameters<typeof database.runTransaction>) => {
+      if (!first) return original(...args);
+      first = false;
+      await callGroupRemove('g1', 'alice', ['bob']);
+      const version: unknown = (await fs('alice').doc('groups/g1').get()).get('updatedAt');
+      await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: Number(version) + 1 });
+      await callGroupSync('g1', 'alice');
+      await assertFails(db('bob').ref('messages/g1').get());
+      await assertFails(db('bob').ref('messages/g1/pending-other').set(message({ senderId: 'bob' })));
+      const result = await original(...args);
+      // A segunda remoção ainda não chegou ao sync final; o commit não pode abrir uma janela de acesso.
+      await assertFails(db('bob').ref('messages/g1').get());
+      return result;
+    });
+    try { await callGroupRemove('g1', 'alice', ['bob']); } finally { patched.mock.restore(); }
+    await assertFails(db('bob').ref('messages/g1').get());
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals').get()).exists(), false);
+  });
+
+  it('falha do sync após commit não bloqueia uma readição posterior autorizada', async () => {
+    await prepare();
+    const database = adminDatabase(); const originalRef = database.ref.bind(database); let calls = 0;
+    const patched = mock.method(database, 'ref', (path?: string) => {
+      const reference = originalRef(path);
+      return new Proxy(reference, { get(target, key) {
+        const value: unknown = Reflect.get(target, key, target);
+        if (path === 'conversationMembers/g1' && key === 'transaction' && typeof value === 'function') {
+          return async (...args: unknown[]) => { if (++calls > 1) throw new Error('Sync e limpeza indisponíveis'); return Reflect.apply(value, target, args); };
+        }
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    });
+    try { await assert.rejects(callGroupRemove('g1', 'alice', ['bob']), /indisponíveis/); }
+    finally { patched.mock.restore(); }
+    await assertFails(db('bob').ref('messages/g1').get());
+    const version: unknown = (await fs('alice').doc('groups/g1').get()).get('updatedAt');
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: Number(version) + 1 });
+    await callGroupSync('g1', 'alice');
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+    await assertSucceeds(db('bob').ref('messages/g1/after-recovery').set(message({ senderId: 'bob' })));
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals').get()).exists(), false);
+  });
+
+  it('sync recupera integrante presente após expirar marcador abandonado sem prova', async () => {
+    await prepare();
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await ctx.database().ref('conversationMembers/g1').set({ alice: true, carol: true, _version: now + 1,
+        _removals: { abandoned: { startedAt: Date.now() - 16 * 60 * 1000, members: { bob: true } } } });
+    });
+    await assertFails(db('bob').ref('messages/g1').get());
+    await assertFails(db('bob').ref('messages/g1/blocked-expired').set(message({ senderId: 'bob' })));
+    assert.equal((await adminFirestore().collection('membershipRemovals').doc('abandoned').get()).exists, false);
+    await callGroupSync('g1', 'alice');
+    assert.ok((await fs('bob').doc('groups/g1').get()).get('memberIds').includes('bob'));
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+    await assertSucceeds(db('bob').ref('messages/g1/recovered-expired').set(message({ senderId: 'bob' })));
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals').get()).exists(), false);
+    assert.equal((await db('alice').ref('conversationMembers/g1/_version').get()).val(), now + 1);
+  });
+
+  it('sync mantém marcador recente sem prova mesmo com edição concorrente mais nova', async () => {
+    await prepare();
+    const startedAt = Date.now() - 60 * 1000;
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await ctx.database().ref('conversationMembers/g1').set({ alice: true, carol: true, _version: now + 1,
+        _removals: { active: { startedAt, members: { bob: true } } } });
+    });
+    await callGroupSync('g1', 'alice');
+    await assertFails(db('bob').ref('messages/g1').get());
+    await fs('alice').doc('groups/g1').update({ name: 'Ainda pendente', updatedBy: 'alice', updatedAt: now + 2 });
+    await callGroupSync('g1', 'alice');
+    await assertFails(db('bob').ref('messages/g1').get());
+    await assertFails(db('bob').ref('messages/g1/recent-pending').set(message({ senderId: 'bob' })));
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals/active/startedAt').get()).val(), startedAt);
+  });
+
+  it('marcador legado sem data permanece protegido quando não há prova', async () => {
+    await prepare();
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await ctx.database().ref('conversationMembers/g1').set({ alice: true, carol: true, _version: now,
+        _removals: { legacy: { bob: true } } });
+    });
+    await callGroupSync('g1', 'alice');
+    await assertFails(db('bob').ref('messages/g1').get());
+    await assertFails(db('bob').ref('messages/g1/legacy-pending').set(message({ senderId: 'bob' })));
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals/legacy/bob').get()).val(), true);
+  });
+
+  it('marcador recente com prova é limpo sem aguardar expiração', async () => {
+    await prepare();
+    await adminFirestore().collection('membershipRemovals').doc('completed').set({ groupId: 'g1', updatedAt: now + 1 });
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await ctx.database().ref('conversationMembers/g1').set({ alice: true, carol: true, _version: now + 1,
+        _removals: { completed: { startedAt: Date.now(), members: { bob: true } } } });
+    });
+    await callGroupSync('g1', 'alice');
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+    await assertSucceeds(db('bob').ref('messages/g1/proven-completed').set(message({ senderId: 'bob' })));
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals').get()).exists(), false);
+  });
+
+  it('sync limpa operação comprovadamente concluída também na versão igual, sem liberar outra pendente', async () => {
+    await prepare();
+    await adminFirestore().collection('membershipRemovals').doc('completed').set({ groupId: 'g1', updatedAt: now + 1 });
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await ctx.database().ref('conversationMembers/g1').set({ alice: true, _version: now + 1,
+        _removals: { completed: { bob: true }, pending: { carol: true } } });
+    });
+    await assertFails(fs('alice').doc('membershipRemovals/completed').get());
+    await assertFails(fs('alice').doc('membershipRemovals/pending').set({ groupId: 'g1', updatedAt: now + 1 }));
+    await callGroupSync('g1', 'alice');
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+    await assertFails(db('carol').ref('messages/g1').get());
+    const pending = await db('alice').ref('conversationMembers/g1/_removals').get();
+    assert.equal(pending.child('completed').exists(), false);
+    assert.equal(pending.child('pending/carol').val(), true);
+    assert.equal((await db('alice').ref('conversationMembers/g1/_version').get()).val(), now + 1);
+  });
+
+  it('readição autorizada depois do commit não fica presa na marca de uma remoção concluída', async () => {
+    await prepare();
+    const database = adminFirestore(); const original = database.runTransaction.bind(database);
+    const patched = mock.method(database, 'runTransaction', async (...args: Parameters<typeof database.runTransaction>) => {
+      const result = await original(...args);
+      const version: unknown = (await fs('alice').doc('groups/g1').get()).get('updatedAt'); assert.equal(typeof version, 'number');
+      await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: Number(version) + 1 });
+      await callGroupSync('g1', 'alice');
+      return result;
+    });
+    try { await callGroupRemove('g1', 'alice', ['bob']); } finally { patched.mock.restore(); }
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+    await assertSucceeds(db('bob').ref('messages/g1/reauthorized').set(message({ senderId: 'bob' })));
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals').get()).exists(), false);
+    assert.equal((await db('alice').ref('conversationMembers/g1/_version').get()).val(), (await fs('alice').doc('groups/g1').get()).get('updatedAt'));
+  });
+});
+
 describe('API: sincronização Firestore → Realtime Database', () => {
   it('API nova grava integrantes planos e mantém leitura/envio nas regras atuais', async () => {
     await callGroupSync('g1', 'alice');
@@ -256,7 +534,8 @@ describe('API: sincronização Firestore → Realtime Database', () => {
     assert.equal(mirror.child('_version').val(), now);
     await assertSucceeds(db('bob').ref('messages/g1').get());
     await assertSucceeds(db('bob').ref('messages/g1/compat').set(message({ senderId: 'bob' })));
-    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupRemove('g1', 'alice', ['bob']);
     await callGroupSync('g1', 'alice');
     await assertFails(db('bob').ref('messages/g1').get());
     await assertFails(db('bob').ref('messages/g1/removed-compat').set(message({ senderId: 'bob' })));
@@ -285,7 +564,8 @@ describe('API: sincronização Firestore → Realtime Database', () => {
       await callGroupSync('g1', 'alice');
       await assertSucceeds(legacy.authenticatedContext('bob').database().ref('messages/g1').get());
       await assertSucceeds(legacy.authenticatedContext('alice').database().ref('messages/g1/old-rules').set(message({ target: { type: 'member', memberId: 'bob' }, mentionedUserIds: ['bob'] })));
-      await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+      await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupRemove('g1', 'alice', ['bob']);
       await callGroupSync('g1', 'alice');
       await assertFails(legacy.authenticatedContext('bob').database().ref('messages/g1').get());
       await assertFails(legacy.authenticatedContext('bob').database().ref('messages/g1/old-removed').set(message({ senderId: 'bob' })));
@@ -299,19 +579,21 @@ describe('API: sincronização Firestore → Realtime Database', () => {
   it('edição sem troca de integrantes não pode regredir a versão e permitir falsa confirmação', async () => {
     await callGroupSync('g1', 'alice');
     await assertFails(fs('alice').doc('groups/g1').update({ name: 'Outro nome', updatedBy: 'alice', updatedAt: 1 }));
-    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupRemove('g1', 'alice', ['bob']);
     await callGroupSync('g1', 'alice');
     await assertFails(db('bob').ref('messages/g1').get());
   });
 
   it('remoção sincronizada revoga leitura/envio e mantém o espelho legível pelo integrante', async () => {
     await callGroupSync('g1', 'alice');
-    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupRemove('g1', 'alice', ['bob']);
     await callGroupSync('g1', 'alice');
     await assertFails(db('bob').ref('messages/g1').get());
     await assertFails(db('bob').ref('messages/g1/removed').set(message({ senderId: 'bob' })));
     const mirror = await assertSucceeds(db('alice').ref('conversationMembers/g1').get());
-    assert.equal(mirror.child('_version').val(), now + 1);
+    assert.equal(mirror.child('_version').val(), (await fs('alice').doc('groups/g1').get()).get('updatedAt'));
     assert.equal(mirror.child('carol').val(), true);
     await assertFails(db('bob').ref('conversationMembers/g1').get());
   });
@@ -343,7 +625,8 @@ describe('API: sincronização Firestore → Realtime Database', () => {
     try {
       const staleSync = callGroupSync('g1', 'alice');
       await ready;
-      await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+      await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupRemove('g1', 'alice', ['bob']);
       await callGroupSync('g1', 'alice');
       release();
       await staleSync;
@@ -353,7 +636,8 @@ describe('API: sincronização Firestore → Realtime Database', () => {
   });
 
   it('falha do espelho rejeita confirmação e nova tentativa conclui a revogação', async () => {
-    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupRemove('g1', 'alice', ['bob']);
     const database = adminDatabase();
     const originalRef = database.ref.bind(database);
     const patched = mock.method(database, 'ref', (path?: string) => {
@@ -373,10 +657,11 @@ describe('API: sincronização Firestore → Realtime Database', () => {
   });
 
   it('uid com nome de metadado não colide com a versão do espelho', async () => {
-    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'updatedAt'], updatedBy: 'alice', updatedAt: now + 1 });
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'updatedAt'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupRemove('g1', 'alice', ['bob']);
     await callGroupSync('g1', 'alice');
     const mirror = await assertSucceeds(db('updatedAt').ref('conversationMembers/g1').get());
-    assert.equal(mirror.child('_version').val(), now + 1);
+    assert.equal(mirror.child('_version').val(), (await fs('alice').doc('groups/g1').get()).get('updatedAt'));
     assert.equal(mirror.child('updatedAt').val(), true);
     await assertSucceeds(db('updatedAt').ref('messages/g1/meta').set(message({ senderId: 'updatedAt' })));
   });
