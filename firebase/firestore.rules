@@ -119,6 +119,11 @@ service cloud.firestore {
         && resource.data.ownerId == request.auth.uid
         && request.resource.data.ownerId == resource.data.ownerId
         && request.resource.data.createdAt == resource.data.createdAt
+        // A versão nunca pode regredir, mesmo numa edição sem troca de integrantes.
+        && request.resource.data.updatedAt >= resource.data.updatedAt
+        // Alterações de integrantes precisam de uma versão nova para o espelho do RTDB.
+        && (request.resource.data.memberIds == resource.data.memberIds
+          || request.resource.data.updatedAt > resource.data.updatedAt)
         && validGroup(request.resource.data);
 
       allow delete: if false;

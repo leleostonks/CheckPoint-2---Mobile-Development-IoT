@@ -5,10 +5,10 @@
 
     "messages": {
       "$conversationId": {
-        ".read": "auth != null && (($conversationId.matches(/^direct_[^_]+_[^_]+$/) && !auth.uid.contains('_') && (($conversationId.beginsWith('direct_' + auth.uid + '_') && auth.uid < $conversationId.replace('direct_' + auth.uid + '_', '')) || ($conversationId.endsWith('_' + auth.uid) && $conversationId.replace('direct_', '').replace('_' + auth.uid, '') < auth.uid))) || (!$conversationId.beginsWith('direct_') && root.child('conversationMembers').child($conversationId).child(auth.uid).val() === true))",
+        ".read": "auth != null && (($conversationId.beginsWith('direct_') && $conversationId !== 'direct_' + auth.uid + '_' + auth.uid && ($conversationId.contains('_' + auth.uid + '_') || $conversationId.endsWith('_' + auth.uid))) || (!$conversationId.beginsWith('direct_') && root.child('conversationMembers').child($conversationId).child(auth.uid).val() === true))",
 
         "$messageId": {
-          ".write": "auth != null && !data.exists() && newData.exists() && (($conversationId.matches(/^direct_[^_]+_[^_]+$/) && !auth.uid.contains('_') && (($conversationId.beginsWith('direct_' + auth.uid + '_') && auth.uid < $conversationId.replace('direct_' + auth.uid + '_', '')) || ($conversationId.endsWith('_' + auth.uid) && $conversationId.replace('direct_', '').replace('_' + auth.uid, '') < auth.uid))) || (!$conversationId.beginsWith('direct_') && root.child('conversationMembers').child($conversationId).child(auth.uid).val() === true))",
+          ".write": "auth != null && !data.exists() && newData.exists() && (($conversationId.beginsWith('direct_') && $conversationId !== 'direct_' + auth.uid + '_' + auth.uid && ($conversationId.contains('_' + auth.uid + '_') || $conversationId.endsWith('_' + auth.uid))) || (!$conversationId.beginsWith('direct_') && root.child('conversationMembers').child($conversationId).child(auth.uid).val() === true))",
           ".validate": "newData.hasChildren(['conversationId', 'conversationType', 'senderId', 'text', 'target', 'createdAt'])",
 
           "conversationId": {
@@ -36,7 +36,6 @@
             }
           },
           "mentionedUserIds": {
-            ".validate": "newData.hasChildren()",
             "$index": {
               ".validate": "newData.isString() && root.child('conversationMembers').child($conversationId).child(newData.val()).val() === true"
             }
