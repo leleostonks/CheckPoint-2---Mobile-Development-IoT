@@ -174,6 +174,9 @@ export async function sendMessage(input: SendMessageInput): Promise<string> {
 }
 
 function parsePushResult(body: unknown): PushDispatchResult {
+  if (isRecord(body) && body.status === 'failed') {
+    throw new ApiError('O servidor não conseguiu enviar a notificação.', 502);
+  }
   if (
     isRecord(body) &&
     (body.status === 'sent' || body.status === 'duplicate' || body.status === 'skipped') &&

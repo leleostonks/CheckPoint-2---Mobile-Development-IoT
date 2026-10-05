@@ -6,6 +6,7 @@ import { Platform } from 'react-native';
 import { ANDROID_CHANNEL_ID } from '../config';
 import type { DeviceRegistration, PushNotificationData, PushTokenType } from '../types/notification';
 import { AppError } from '../utils/errorMessages';
+import { isRecord } from '../utils/parse';
 import { firestore } from './firebase';
 
 export class NotificationPermissionError extends AppError {
@@ -79,9 +80,9 @@ function getEasProjectId(): string | undefined {
   if (fromEas) {
     return fromEas;
   }
-  const extra = Constants.expoConfig?.extra;
-  const eas = extra && typeof extra === 'object' ? extra.eas : undefined;
-  return eas && typeof eas === 'object' && typeof eas.projectId === 'string' ? eas.projectId : undefined;
+  const extra: unknown = Constants.expoConfig?.extra;
+  const eas: unknown = isRecord(extra) ? extra.eas : undefined;
+  return isRecord(eas) && typeof eas.projectId === 'string' ? eas.projectId : undefined;
 }
 
 /**

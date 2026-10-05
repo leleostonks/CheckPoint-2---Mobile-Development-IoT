@@ -123,9 +123,9 @@ async function sendViaExpo(devices: readonly DeviceTarget[], content: PushConten
       ),
     });
     const parsed = expoResponseSchema.safeParse(await response.json().catch(() => null));
-    if (!response.ok || !parsed.success) {
-      result.failed += batch.length;
-      continue;
+    if (!response.ok || !parsed.success || parsed.data.data.length !== batch.length) {
+      // Sem um ticket por aparelho, não sabemos se o provedor aceitou o envio: não liberar retry.
+      throw new Error('Resultado incerto do envio pelo Expo Push Service.');
     }
     parsed.data.data.forEach((ticket, index) => {
       if (ticket.status === 'ok') {

@@ -42,6 +42,7 @@ export function ChatScreen({ conversationId, conversationType }: ChatScreenProps
     conversationId,
     conversationType,
     currentUid: user.uid,
+    enabled: !isGroup || (group?.memberIds.includes(user.uid) ?? false),
   });
 
   // Evita banner de push da conversa que está aberta.

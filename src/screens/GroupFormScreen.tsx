@@ -51,6 +51,7 @@ export function GroupFormScreen({ groupId }: GroupFormScreenProps) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const initializedRef = useRef(false);
+  const initialMemberIdsRef = useRef<readonly string[]>([]);
 
   const ownerId = group?.ownerId ?? user.uid;
   const isOwner = ownerId === user.uid;
@@ -59,6 +60,7 @@ export function GroupFormScreen({ groupId }: GroupFormScreenProps) {
   useEffect(() => {
     if (group && !initializedRef.current) {
       initializedRef.current = true;
+      initialMemberIdsRef.current = [...group.memberIds];
       setName(group.name);
       setLimitText(String(group.memberLimit));
       setPolicy(group.notificationPolicy);
@@ -124,8 +126,9 @@ export function GroupFormScreen({ groupId }: GroupFormScreenProps) {
             name,
             memberLimit,
             notificationPolicy: policy,
-            addMemberIds: allMemberIds.filter((id) => !group.memberIds.includes(id)),
-            removeMemberIds: group.memberIds.filter((id) => !selected.has(id)),
+            // Só aplica a intenção deste formulário sobre o grupo mais recente da transação.
+            addMemberIds: allMemberIds.filter((id) => !initialMemberIdsRef.current.includes(id)),
+            removeMemberIds: initialMemberIdsRef.current.filter((id) => !selected.has(id)),
           },
           photo,
         );

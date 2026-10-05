@@ -8,6 +8,7 @@ type HttpMethod = 'GET' | 'POST';
 type RequestOptions = {
   method: HttpMethod;
   body?: Readonly<Record<string, unknown>>;
+  timeoutMs?: number;
 };
 
 export class ApiError extends AppError {
@@ -40,7 +41,7 @@ export async function apiRequest<T>(
 
   const idToken = await user.getIdToken();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? API_TIMEOUT_MS);
 
   let response: Response;
   try {

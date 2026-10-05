@@ -54,12 +54,15 @@ Firestore
                               notificationPolicy, updatedBy, createdAt, updatedAt
   directConversations/{id}    participantIds, createdAt        (id = direct_<uidA>_<uidB>, uids ordenados)
   notificationDeliveries/{id} controle de duplicidade (somente API)
+  membershipRemovals/{id}     prova de conclusão da remoção (somente API)
 
 Realtime Database
   messages/{conversationId}/{messageId}
       conversationId, conversationType, senderId, text,
       target {type: conversation | member, memberId?}, mentionedUserIds[], createdAt
-  conversationMembers/{groupId}/{uid}: true               (somente API)
+  conversationMembers/{groupId}/{uid}: true                (somente API)
+  conversationMembers/{groupId}/_version: number           (versão do grupo; somente API)
+  conversationMembers/{groupId}/_removals/{operationId}    startedAt, members {uid: true} (somente API)
 ```
 
 ---
@@ -149,6 +152,7 @@ O Firebase Storage exige o plano Blaze (cartão de crédito) em projetos novos, 
 | GET | `/health` | — | Health check: `status`, horário e se Firebase/Cloudinary estão configurados (sem expor valores). |
 | POST | `/notifications/messages` | Bearer ID token | Body `{ conversationId, messageId }`. Valida, calcula destinatários e envia o push. Idempotente. |
 | POST | `/groups/:groupId/sync-members` | Bearer ID token | Espelha os integrantes do Firestore em `conversationMembers/{groupId}` (RTDB). |
+| POST | `/groups/:groupId/remove-members` | Bearer ID token | Body `{ memberIds, addMemberIds?, memberLimit? }` (`memberIds` são as remoções). Somente o proprietário; pré-revoga RTDB, aplica o conjunto final e limite em uma transação Firestore e sincroniza. Preserva o proprietário e pelo menos dois integrantes. |
 | GET | `/profiles/:uid` | Bearer ID token | Dados cadastrais, somente se houver conversa individual ou grupo em comum. |
 | POST | `/uploads/signature` | Bearer ID token | Assinatura de upload do Cloudinary (`{ folder: "profiles" \| "groups" }`). |
 
@@ -159,10 +163,16 @@ Fluxo do push (`POST /notifications/messages`):
 3. Lê a mensagem no RTDB e confirma que `senderId` é o usuário autenticado.
 4. Lê no Firestore os participantes/integrantes, a política e os tokens ativos.
 5. Calcula os destinatários **no servidor** (nunca aceita lista do app) e remove o remetente.
-6. Registra `notificationDeliveries/{conversationId}__{messageId}` com `create()` atômico: reenvios retornam `duplicate` e não geram push repetido.
-7. Envia pelo FCM (tokens Android) e pelo Expo Push Service (tokens iOS); tokens inválidos são desativados.
+6. Repara o espelho do grupo com a versão atual do Firestore e reserva `notificationDeliveries/{conversationId}__{messageId}` por transação. Duas chamadas simultâneas geram apenas um envio. A preparação (`processing`) tem lease de 60 segundos; falha antes do envio ou lease expirada permite nova tentativa. A API confere a tentativa antes de iniciar o envio.
+7. Envia pelo FCM (tokens Android) e pelo Expo Push Service (tokens iOS); tokens rejeitados como inválidos na resposta imediata são desativados.
+
+Falha total confirmada (`delivered = 0`, `failed > 0`) retorna erro e permite retry. Entrega parcial ou resultado incerto depois de começar o envio bloqueia reenvios, priorizando a proteção contra notificações duplicadas. Resposta Expo inválida, incompleta ou sem confirmação individual é incerta. Registros antigos `processing` sem lease também permanecem bloqueados, pois podem representar envios já aceitos. A limpeza de tokens ocorre depois de registrar o resultado confirmado.
+
+**Limitação conhecida no iOS (Expo Push):** um ticket aceito, contado como `delivered` pela API, confirma apenas a aceitação pelo serviço, não a entrega no aparelho. A consulta de receipts não está implementada; tokens cuja invalidação aparece somente no receipt não são desativados.
 
 O texto do push não inclui o conteúdo da mensagem (ex.: “Ana enviou uma mensagem.”), só remetente e conversa.
+
+Se o push falhar (status `failed` ou erro HTTP), o aviso existente informa que a mensagem foi enviada e a notificação falhou, sem desfazer a mensagem salva.
 
 ### Variáveis de ambiente (nomes)
 
@@ -178,6 +188,14 @@ Veja [`server/.env.example`](server/.env.example): `FIREBASE_PROJECT_ID`, `FIREB
 
 A Vercel mantém a API sempre disponível (sem servidor local e sem “hibernar”).
 
+### Ordem de publicação
+
+1. Deploy da API atualizada, substituindo a versão antiga: a API antiga não tem proteção monotônica e pode restaurar um espelho desatualizado.
+2. Novo build do app (APK), com remoções pelo endpoint da API.
+3. `firebase deploy` das regras versionadas. Com as regras novas, o APK antigo não consegue remover integrantes, pois tenta fazê-lo diretamente no Firestore (B01).
+
+O mapa plano do espelho continua compatível com regras antigas; a sequência acima evita publicar o bloqueio de remoções do Firestore antes de disponibilizar API e APK compatíveis.
+
 ### Executar a API localmente (opcional)
 
 ```bash
@@ -185,7 +203,7 @@ cd server
 npm install
 cp .env.example .env   # preencha com valores reais (arquivo ignorado pelo git)
 npm run dev            # http://localhost:3000
-npm test               # testes das políticas de destinatários
+npm test               # 48 testes: políticas, push, sincronização, formulário, listener, logout e tipos
 ```
 
 ---
@@ -218,6 +236,7 @@ Variáveis opcionais do app: [`.env.example`](.env.example) (`EXPO_PUBLIC_API_UR
 
 - Exige conta Apple Developer (paga) e build pelo EAS (`--platform ios`), que configura a chave APNs.
 - O app registra um token do Expo Push Service (`getExpoPushTokenAsync` com o `projectId` do EAS), e a API entrega por ele.
+- O ticket aceito não confirma entrega; receipts não são consultados e tokens invalidados apenas nessa etapa permanecem ativos (limitação conhecida).
 
 ### Ao tocar na notificação
 
@@ -244,7 +263,8 @@ Regras gerais, aplicadas na API ([`recipientResolver.ts`](server/src/services/re
 
 - `memberLimit` é definido na criação (inteiro de 2 a 100, **incluindo o proprietário**) e pode ser alterado pelo proprietário.
 - A interface mostra a quantidade atual e as **vagas disponíveis**, e impede selecionar além do limite.
-- O `groupService` altera integrantes dentro de uma **transação do Firestore**: lê a versão mais recente, aplica as mudanças (sem sobrescrever alterações de outros) e valida o limite.
+- Quando há remoções, o `groupService` envia remoções, adições e limite à API, que valida o conjunto final e o grava em uma **transação do Firestore**; depois o SDK altera somente nome, política e foto. Isso permite substituir um integrante num grupo com limite de dois. Sem remoções, adições e demais mudanças continuam em transação pelo SDK. As transações leem o estado mais recente; adições só ganham acesso ao RTDB após sincronização.
+- O formulário envia somente adições/remoções em relação à seleção que tinha ao abrir. Salvar só o nome preserva integrantes adicionados em outra sessão; a transação aplica a intenção do usuário sobre o grupo atual.
 - **As regras do Firestore repetem a validação no servidor:** `memberIds.size() <= memberLimit`, `memberLimit >= memberIds.size()`, sem duplicados, somente o proprietário altera. As regras avaliam o documento **resultante** de cada escrita, e o Firestore serializa escritas concorrentes no mesmo documento. Por isso duas entradas simultâneas nunca ultrapassam o limite, mesmo vindas de um cliente modificado.
 
 Isso é comprovado por um teste automatizado nos emuladores. Com 1 vaga e 2 entradas simultâneas (`arrayUnion`), exatamente uma é aceita:
@@ -252,7 +272,7 @@ Isso é comprovado por um teste automatizado nos emuladores. Com 1 vaga e 2 entr
 ```bash
 cd firebase/tests
 npm install
-npm test        # requer Java 21+ (emuladores do Firebase) — 18 testes das regras
+npm test        # requer Java 21+ (emuladores do Firebase) — 55 testes das regras, remoção e sincronização
 ```
 
 ---
@@ -262,14 +282,23 @@ npm test        # requer Java 21+ (emuladores do Firebase) — 18 testes das reg
 Regras versionadas: [`firebase/firestore.rules`](firebase/firestore.rules) e [`firebase/database.rules.json`](firebase/database.rules.json).
 
 - Somente usuários autenticados acessam dados; nada é público.
-- **Mensagens:** só participantes leem/enviam; `senderId` deve ser o `auth.uid`; mensagens não podem ser editadas/sobrescritas; `createdAt` = horário do servidor; destinatário e menções precisam ser integrantes.
-- **Conversas individuais:** id `direct_<uidA>_<uidB>` com uids ordenados, o que garante exatamente 2 participantes, nenhuma conversa consigo mesmo e nenhuma duplicata.
-- **Grupos:** só integrantes leem; só o proprietário gerencia; limite validado nas regras.
-- **Tokens de dispositivos:** legíveis apenas pelo dono; removidos no logout.
+- **Mensagens:** só participantes leem/enviam; `senderId` deve ser o `auth.uid`; mensagens não podem ser editadas/sobrescritas; `createdAt` = horário do servidor; destinatário e menções precisam ser integrantes. Menções presentes precisam ter estrutura de lista, nunca texto ou booleano.
+- **Conversas individuais:** as regras exigem exatamente `direct_<uidA>_<uidB>`, sem `_` dentro dos uids, com dois uids diferentes e ordenados; o usuário autenticado deve ser um deles.
+  Limitação residual (A04): o RTDB aceita um ID nesse formato com o outro uid inexistente, pois suas regras não consultam o Firestore/Auth. Isso não permite leitura por terceiros; a API recusa o push porque não há conversa correspondente no Firestore.
+- **Grupos:** só integrantes leem; só o proprietário gerencia; limite validado nas regras. Updates do cliente precisam preservar todos os integrantes atuais (`hasAll`); remoções são exclusivas da API.
+- **Tokens de dispositivos:** legíveis apenas pelo dono; todos os caminhos de logout tentam remover o aparelho antes de encerrar a sessão. Falha gera aviso no log; a espera é limitada a 3 segundos para permitir logout offline. Nesse caso a exclusão do token pode não ser confirmada. Resultados de registro cancelado não substituem a referência da sessão atual.
 - **Dados cadastrais:** `users/{uid}` só é lido pelo próprio dono. Perfis de terceiros passam pela API, que confere se existe conversa/grupo em comum. A lista de usuários usa `publicProfiles` (só nome e foto).
-- **Usuário removido de grupo:** perde a leitura do grupo no Firestore e, após a sincronização, do espelho no RTDB, deixando de ler e enviar mensagens novas.
+- **Usuário removido de grupo:** a API retira primeiro a autorização no RTDB, sem alterar `_version`, e só depois confirma a remoção no Firestore. O usuário já não pode ler/enviar mensagens quando o commit acontece; o listener do app é encerrado ao perder a participação. O cliente tenta o endpoint até três vezes e informa quando a confirmação falha.
 
 **Decisão documentada:** as regras do Realtime Database não conseguem consultar o Firestore. Por isso a API (Admin SDK) espelha os integrantes do grupo em `conversationMembers/{groupId}`, que o app não pode gravar, e faz as validações que cruzam os dois bancos (push, perfis).
+
+O espelho mantém o mapa plano `{ uid: true }` e guarda a versão em `_version`, chave reservada que não é UID gerado por autenticação de e-mail/senha. As regras conferem `child(uid) === true`; metadados não concedem acesso. A API usa transação no RTDB e aplica listas de versões mais novas (ausente = -1); `updatedAt` nunca pode regredir e a remoção usa `max(now, atual + 1)`.
+
+Durante a remoção, `_removals` protege os uids pré-revogados inclusive contra sync de uma edição concorrente mais nova. O mesmo commit Firestore grava uma prova privada em `membershipRemovals`; o sync limpa operações concluídas ou abandonadas com segurança, preservando outras ainda pendentes. Essa limpeza também pode ocorrer na versão igual, sem mudar `_version`, e permite recuperação após falha do sync e readição autorizada. Se o commit falhar, a API restaura explicitamente pelo Firestore atual e retorna erro; se a restauração estiver indisponível, mantém o acesso fechado e retorna 503. Se a API estiver indisponível antes da pré-revogação, o cliente não remove no Firestore. Os bancos não têm commit atômico; uma falha depois da pré-revogação pode deixar acesso fechado até recuperação.
+
+O processamento de push de grupo também repara o espelho. O mapa plano funciona com regras antigas e atuais; espelhos legados sem `_version` recebem a versão no próximo sync. A proteção exige a API atualizada e, para impedir remoções diretas por clientes antigos/modificados, as regras novas; siga a ordem de publicação acima.
+
+**Disponibilidade:** no próximo sync, marcadores sem prova e com `startedAt` do servidor há mais de 15 minutos expiram, recuperando integrantes presentes no Firestore. A função deve terminar antes desse prazo. Recentes permanecem fechados; legados sem data exigem recuperação administrativa, sem critério seguro de abandono.
 
 Credenciais administrativas existem **somente** nas variáveis da Vercel. `firebaseConfig.json` contém apenas a configuração do SDK cliente, e o `.gitignore` bloqueia `.env`, `serviceAccountKey*.json` e chaves `*-firebase-adminsdk-*.json`.
 
@@ -294,6 +323,8 @@ Push real entregue pela API (FCM) com o app em segundo plano; ao tocar na notifi
 ---
 
 ## ✅ Qualidade
+
+Os testes do app ficam em `server/src/tests/app/` e usam o runner do servidor (`cd server && npm test`), pois o app não possui runner próprio; nenhuma dependência adicional é necessária.
 
 ```bash
 npm run typecheck      # tsc --noEmit (app)

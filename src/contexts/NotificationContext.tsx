@@ -27,14 +27,15 @@ export const NotificationContext = createContext<NotificationContextValue | null
 configureForegroundNotifications();
 
 export function NotificationProvider({ children }: PropsWithChildren) {
-  const { status: authStatus, profile } = useAuth();
+  const { status: authStatus, profile, firebaseUser } = useAuth();
   const router = useRouter();
   const uid = authStatus === 'signedIn' && profile ? profile.uid : null;
+  const authenticatedUid = firebaseUser?.uid ?? null;
 
   const [attempt, setAttempt] = useState(0);
   /** Resultado do registro, associado ao usuário e à tentativa a que pertence. */
   const [statusEntry, setStatusEntry] = useState<{ key: string; status: NotificationStatus } | null>(null);
-  const registeredRef = useRef<RegisteredToken | null>(null);
+  const registeredRef = useRef<{ uid: string; token: RegisteredToken } | null>(null);
   const handledResponseRef = useRef<string | null>(null);
 
   const registrationKey = uid ? `${uid}#${attempt}` : null;
@@ -48,9 +49,11 @@ export function NotificationProvider({ children }: PropsWithChildren) {
   // Registro do aparelho após o login (e a cada nova tentativa).
   useEffect(() => {
     if (!uid || !registrationKey) {
-      registeredRef.current = null;
+      // Um erro de perfil não deve apagar a referência necessária ao logout da sessão atual.
+      if (!authenticatedUid) registeredRef.current = null;
       return undefined;
     }
+    if (registeredRef.current?.uid !== uid) registeredRef.current = null;
     let cancelled = false;
     const report = (next: NotificationStatus) => {
       if (!cancelled) {
@@ -60,7 +63,8 @@ export function NotificationProvider({ children }: PropsWithChildren) {
 
     registerDeviceForPush(uid)
       .then((registered) => {
-        registeredRef.current = registered;
+        if (cancelled) return;
+        registeredRef.current = { uid, token: registered };
         report({ state: 'registered', token: registered.token });
       })
       .catch((error: unknown) => {
@@ -72,9 +76,10 @@ export function NotificationProvider({ children }: PropsWithChildren) {
       });
 
     const subscription = Notifications.addPushTokenListener((token) => {
-      updateRefreshedToken(uid, registeredRef.current, token)
+      updateRefreshedToken(uid, registeredRef.current?.token ?? null, token)
         .then((registered) => {
-          registeredRef.current = registered;
+          if (cancelled) return;
+          registeredRef.current = registered ? { uid, token: registered } : null;
           if (registered) {
             report({ state: 'registered', token: registered.token });
           }
@@ -86,7 +91,7 @@ export function NotificationProvider({ children }: PropsWithChildren) {
       cancelled = true;
       subscription.remove();
     };
-  }, [uid, registrationKey]);
+  }, [uid, registrationKey, authenticatedUid]);
 
   // Toque na notificação: cobre app aberto, em segundo plano e fechado (useLastNotificationResponse).
   const lastResponse = Notifications.useLastNotificationResponse();
@@ -114,11 +119,11 @@ export function NotificationProvider({ children }: PropsWithChildren) {
 
   const unregisterCurrentDevice = useCallback(async () => {
     const registered = registeredRef.current;
-    if (uid && registered) {
-      await unregisterDevice(uid, registered.token).catch(() => undefined);
-      registeredRef.current = null;
+    if (authenticatedUid && registered?.uid === authenticatedUid) {
+      await unregisterDevice(authenticatedUid, registered.token.token);
+      if (registeredRef.current === registered) registeredRef.current = null;
     }
-  }, [uid]);
+  }, [authenticatedUid]);
 
   const value = useMemo<NotificationContextValue>(
     () => ({ status, retryRegistration, unregisterCurrentDevice }),

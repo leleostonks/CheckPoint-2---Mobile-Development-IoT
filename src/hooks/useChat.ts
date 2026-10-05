@@ -9,6 +9,7 @@ type UseChatParams = {
   conversationId: string;
   conversationType: ConversationType;
   currentUid: string;
+  enabled?: boolean;
 };
 
 export type SendOptions = {
@@ -61,7 +62,7 @@ type MessageFeed = {
   error: string | null;
 };
 
-export function useChat({ conversationId, conversationType, currentUid }: UseChatParams): UseChatResult {
+export function useChat({ conversationId, conversationType, currentUid, enabled = true }: UseChatParams): UseChatResult {
   const [feed, setFeed] = useState<MessageFeed | null>(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -69,11 +70,13 @@ export function useChat({ conversationId, conversationType, currentUid }: UseCha
   const [subscriptionAttempt, setSubscriptionAttempt] = useState(0);
   const syncAttemptedRef = useRef(false);
 
-  const feedKey = `${conversationId}#${subscriptionAttempt}`;
-  const currentFeed = feed?.key === feedKey ? feed : null;
+  const feedKey = `${conversationId}#${currentUid}#${subscriptionAttempt}`;
+  const currentFeed = enabled && feed?.key === feedKey ? feed : null;
 
   // Listener em tempo real; removido ao desmontar a tela ou trocar de conversa.
   useEffect(() => {
+    if (!enabled) return undefined;
+    let cancelled = false;
     const unsubscribe = subscribeMessages(
       conversationId,
       (items) => setFeed({ key: feedKey, messages: items, error: null }),
@@ -83,8 +86,8 @@ export function useChat({ conversationId, conversationType, currentUid }: UseCha
         if (conversationType === 'group' && isPermissionDenied(subscriptionError) && !syncAttemptedRef.current) {
           syncAttemptedRef.current = true;
           syncGroupMembers(conversationId)
-            .then(() => setSubscriptionAttempt((value) => value + 1))
-            .catch(() => fail('Você não tem acesso a esta conversa.'));
+            .then(() => { if (!cancelled) setSubscriptionAttempt((value) => value + 1); })
+            .catch(() => { if (!cancelled) fail('Você não tem acesso a esta conversa.'); });
           return;
         }
         fail(
@@ -94,15 +97,19 @@ export function useChat({ conversationId, conversationType, currentUid }: UseCha
         );
       },
     );
-    return unsubscribe;
-  }, [conversationId, conversationType, feedKey]);
+    return () => { cancelled = true; unsubscribe(); };
+  }, [conversationId, conversationType, feedKey, enabled]);
 
   const messages = useMemo(() => currentFeed?.messages ?? [], [currentFeed]);
-  const loading = currentFeed === null;
+  const loading = enabled && currentFeed === null;
   const error = currentFeed?.error ?? null;
 
   const send = useCallback(
     async ({ text, target, mentionedUserIds }: SendOptions): Promise<boolean> => {
+      if (!enabled) {
+        setSendError('Você não tem acesso a esta conversa.');
+        return false;
+      }
       setSending(true);
       setSendError(null);
       setPushWarning(null);
@@ -125,11 +132,11 @@ export function useChat({ conversationId, conversationType, currentUid }: UseCha
 
       // A mensagem já está salva; o push é solicitado à API sem bloquear a conversa.
       requestMessagePush(conversationId, messageId).catch((pushFailure: unknown) => {
-        setPushWarning(getErrorMessage(pushFailure, 'Mensagem enviada, mas a notificação não pôde ser disparada.'));
+        setPushWarning(`Mensagem enviada, mas a notificação não pôde ser disparada. ${getErrorMessage(pushFailure)}`);
       });
       return true;
     },
-    [conversationId, conversationType, currentUid],
+    [conversationId, conversationType, currentUid, enabled],
   );
 
   const clearSendError = useCallback(() => {
