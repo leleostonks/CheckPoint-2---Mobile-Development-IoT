@@ -30,6 +30,7 @@ export type GroupRecord = {
   memberIds: string[];
   memberLimit: number;
   notificationPolicy: NotificationPolicy;
+  updatedAt: number;
 };
 
 /** Ids aceitos em caminhos do Firebase: sem `.`, `#`, `$`, `[`, `]` ou `/`. */
@@ -65,6 +66,7 @@ export const groupDocumentSchema = z.object({
   memberIds: z.array(z.string()),
   memberLimit: z.number().int(),
   notificationPolicy: z.enum(NOTIFICATION_POLICIES).catch('all_group_messages'),
+  updatedAt: z.number().int(),
 });
 
 const DIRECT_PREFIX = 'direct_';

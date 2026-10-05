@@ -75,7 +75,15 @@ export function subscribeGroup(
  * As regras do Realtime Database usam esse espelho para autorizar leitura e envio de mensagens.
  */
 export async function syncGroupMembers(groupId: string): Promise<void> {
-  await apiRequest(`/groups/${encodeURIComponent(groupId)}/sync-members`, { method: 'POST' }, parseOk);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await apiRequest(`/groups/${encodeURIComponent(groupId)}/sync-members`, { method: 'POST', timeoutMs: 5000 }, parseOk);
+      return;
+    } catch {
+      if (attempt < 2) await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  throw new AppError('A sincronização do grupo falhou: a revogação de acesso não foi confirmada. Verifique sua conexão e tente salvar novamente.');
 }
 
 function assertValid(message: string | null): void {
@@ -159,7 +167,7 @@ export async function updateGroup(
       memberLimit: input.memberLimit,
       notificationPolicy: input.notificationPolicy,
       updatedBy: currentUid,
-      updatedAt: Date.now(),
+      updatedAt: Math.max(Date.now(), group.updatedAt + 1),
       ...(photoUrl ? { photoUrl } : {}),
     };
     transaction.update(groupWriteRef(groupId), changes);
@@ -184,7 +192,7 @@ export async function removeGroupMember(groupId: string, currentUid: string, mem
     }
     const memberIds = applyMemberChanges(group.memberIds, [], [memberId]);
     assertValid(validateMemberCount(memberIds.length));
-    const changes: Partial<GroupDocument> = { memberIds, updatedBy: currentUid, updatedAt: Date.now() };
+    const changes: Partial<GroupDocument> = { memberIds, updatedBy: currentUid, updatedAt: Math.max(Date.now(), group.updatedAt + 1) };
     transaction.update(groupWriteRef(groupId), changes);
   });
   await syncGroupMembers(groupId);

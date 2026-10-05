@@ -5,6 +5,7 @@ import { HttpError } from '../errors';
 import { authenticate, getAuthenticatedUid } from '../middleware/authenticate';
 import { adminDatabase } from '../services/firebaseAdmin';
 import { loadGroup } from '../services/recipientResolver';
+import { syncMembershipMirror } from '../services/membershipMirror';
 
 export const groupsRouter = Router();
 
@@ -27,7 +28,7 @@ groupsRouter.post('/groups/:groupId/sync-members', authenticate, async (req, res
     throw new HttpError(403, 'Você não é integrante deste grupo.');
   }
 
-  // Substitui o espelho inteiro: integrantes removidos perdem o acesso às mensagens.
-  await mirrorRef.set(Object.fromEntries(group.memberIds.map((memberId) => [memberId, true])));
+  // A transação aceita apenas versões mais novas; uma sincronização atrasada não desfaz remoções.
+  await syncMembershipMirror(group);
   res.json({ ok: true, members: group.memberIds.length });
 });
