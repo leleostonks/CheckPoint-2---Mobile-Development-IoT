@@ -1,20 +1,25 @@
 import type { ConfigContext, ExpoConfig } from 'expo/config';
 
+/** Variáveis de ambiente são uma entrada externa: aceita apenas texto. */
+function environmentString(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
 /**
  * Identificadores nativos. Devem ser os mesmos cadastrados no app Android/iOS do Firebase.
  * Pode ser trocado por variável de ambiente sem editar este arquivo.
  */
-const ANDROID_PACKAGE = process.env.ANDROID_PACKAGE ?? 'br.com.fiap.chatfirebase';
-const IOS_BUNDLE_ID = process.env.IOS_BUNDLE_ID ?? 'br.com.fiap.chatfirebase';
+const ANDROID_PACKAGE = environmentString(process.env.ANDROID_PACKAGE, 'br.com.fiap.chatfirebase');
+const IOS_BUNDLE_ID = environmentString(process.env.IOS_BUNDLE_ID, 'br.com.fiap.chatfirebase');
 /** Projeto EAS (conta leleo2). Pode ser trocado pela variável EAS_PROJECT_ID. */
-const EAS_PROJECT_ID = process.env.EAS_PROJECT_ID ?? '3797e9fb-ab9c-4429-9a59-3dababb9fe98';
-const EAS_OWNER = process.env.EAS_OWNER ?? 'leleo2';
+const EAS_PROJECT_ID = environmentString(process.env.EAS_PROJECT_ID, '3797e9fb-ab9c-4429-9a59-3dababb9fe98');
+const EAS_OWNER = environmentString(process.env.EAS_OWNER, 'leleo2');
 
 /**
  * Arquivo do app Android no Firebase (necessário para o FCM).
  * Local: coloque `google-services.json` na raiz. No EAS: variável de arquivo GOOGLE_SERVICES_JSON.
  */
-const googleServicesFile = process.env.GOOGLE_SERVICES_JSON ?? './google-services.json';
+const googleServicesFile = environmentString(process.env.GOOGLE_SERVICES_JSON, './google-services.json');
 
 export default ({ config }: ConfigContext): ExpoConfig => ({
   ...config,

@@ -4,11 +4,13 @@ import { Button } from '../components/Button';
 import { ErrorMessage } from '../components/ErrorMessage';
 import { Loading } from '../components/Loading';
 import { useAuth } from '../hooks/useAuth';
+import { useSignOut } from '../hooks/useNotifications';
 import { colors, spacing } from '../utils/theme';
 
 /** Estados intermediários da sessão: carregando o perfil ou conta sem perfil gravado. */
 export default function SessionRoute() {
-  const { status, signOut } = useAuth();
+  const { status } = useAuth();
+  const signOut = useSignOut();
 
   if (status === 'initializing' || status === 'loadingProfile') {
     return <Loading message="Carregando sua conta..." />;
@@ -22,7 +24,7 @@ export default function SessionRoute() {
   return (
     <View style={styles.container}>
       <ErrorMessage message={message} />
-      <Button title="Sair" variant="danger" onPress={() => signOut().catch(() => undefined)} />
+      <Button title="Sair" variant="danger" onPress={() => signOut().catch(() => console.warn('Não foi possível encerrar a sessão.'))} />
     </View>
   );
 }
