@@ -59,7 +59,8 @@ Realtime Database
   messages/{conversationId}/{messageId}
       conversationId, conversationType, senderId, text,
       target {type: conversation | member, memberId?}, mentionedUserIds[], createdAt
-  conversationMembers/{groupId}/{uid}: true               (somente API)
+  conversationMembers/{groupId}/{uid}: true                (somente API)
+  conversationMembers/{groupId}/_version: number           (versão do grupo; somente API)
 ```
 
 ---
@@ -159,10 +160,14 @@ Fluxo do push (`POST /notifications/messages`):
 3. Lê a mensagem no RTDB e confirma que `senderId` é o usuário autenticado.
 4. Lê no Firestore os participantes/integrantes, a política e os tokens ativos.
 5. Calcula os destinatários **no servidor** (nunca aceita lista do app) e remove o remetente.
-6. Registra `notificationDeliveries/{conversationId}__{messageId}` com `create()` atômico: reenvios retornam `duplicate` e não geram push repetido.
+6. Repara o espelho do grupo com a versão atual do Firestore e reserva `notificationDeliveries/{conversationId}__{messageId}` por transação. Duas chamadas simultâneas geram apenas um envio. A preparação (`processing`) tem lease de 60 segundos; falha antes do envio ou lease expirada permite nova tentativa. A API confere a tentativa antes de iniciar o envio.
 7. Envia pelo FCM (tokens Android) e pelo Expo Push Service (tokens iOS); tokens inválidos são desativados.
 
+Falha total confirmada (`delivered = 0`, `failed > 0`) retorna erro e permite retry. Entrega parcial ou resultado incerto depois de começar o envio bloqueia reenvios, priorizando a proteção contra notificações duplicadas. Resposta Expo inválida, incompleta ou sem confirmação individual é incerta. Registros antigos `processing` sem lease também permanecem bloqueados, pois podem representar envios já aceitos. A limpeza de tokens ocorre depois de registrar o resultado confirmado.
+
 O texto do push não inclui o conteúdo da mensagem (ex.: “Ana enviou uma mensagem.”), só remetente e conversa.
+
+Se o push falhar (status `failed` ou erro HTTP), o aviso existente informa que a mensagem foi enviada e a notificação falhou, sem desfazer a mensagem salva.
 
 ### Variáveis de ambiente (nomes)
 
@@ -185,7 +190,7 @@ cd server
 npm install
 cp .env.example .env   # preencha com valores reais (arquivo ignorado pelo git)
 npm run dev            # http://localhost:3000
-npm test               # testes das políticas de destinatários
+npm test               # 43 testes: políticas, push, sincronização, formulário, listener, logout e tipos
 ```
 
 ---
@@ -245,6 +250,7 @@ Regras gerais, aplicadas na API ([`recipientResolver.ts`](server/src/services/re
 - `memberLimit` é definido na criação (inteiro de 2 a 100, **incluindo o proprietário**) e pode ser alterado pelo proprietário.
 - A interface mostra a quantidade atual e as **vagas disponíveis**, e impede selecionar além do limite.
 - O `groupService` altera integrantes dentro de uma **transação do Firestore**: lê a versão mais recente, aplica as mudanças (sem sobrescrever alterações de outros) e valida o limite.
+- O formulário envia somente adições/remoções em relação à seleção que tinha ao abrir. Salvar só o nome preserva integrantes adicionados em outra sessão; a transação aplica a intenção do usuário sobre o grupo atual.
 - **As regras do Firestore repetem a validação no servidor:** `memberIds.size() <= memberLimit`, `memberLimit >= memberIds.size()`, sem duplicados, somente o proprietário altera. As regras avaliam o documento **resultante** de cada escrita, e o Firestore serializa escritas concorrentes no mesmo documento. Por isso duas entradas simultâneas nunca ultrapassam o limite, mesmo vindas de um cliente modificado.
 
 Isso é comprovado por um teste automatizado nos emuladores. Com 1 vaga e 2 entradas simultâneas (`arrayUnion`), exatamente uma é aceita:
@@ -252,7 +258,7 @@ Isso é comprovado por um teste automatizado nos emuladores. Com 1 vaga e 2 entr
 ```bash
 cd firebase/tests
 npm install
-npm test        # requer Java 21+ (emuladores do Firebase) — 18 testes das regras
+npm test        # requer Java 21+ (emuladores do Firebase) — 31 testes das regras e sincronização
 ```
 
 ---
@@ -262,14 +268,18 @@ npm test        # requer Java 21+ (emuladores do Firebase) — 18 testes das reg
 Regras versionadas: [`firebase/firestore.rules`](firebase/firestore.rules) e [`firebase/database.rules.json`](firebase/database.rules.json).
 
 - Somente usuários autenticados acessam dados; nada é público.
-- **Mensagens:** só participantes leem/enviam; `senderId` deve ser o `auth.uid`; mensagens não podem ser editadas/sobrescritas; `createdAt` = horário do servidor; destinatário e menções precisam ser integrantes.
-- **Conversas individuais:** id `direct_<uidA>_<uidB>` com uids ordenados, o que garante exatamente 2 participantes, nenhuma conversa consigo mesmo e nenhuma duplicata.
+- **Mensagens:** só participantes leem/enviam; `senderId` deve ser o `auth.uid`; mensagens não podem ser editadas/sobrescritas; `createdAt` = horário do servidor; destinatário e menções precisam ser integrantes. Menções presentes precisam ter estrutura de lista, nunca texto ou booleano.
+- **Conversas individuais:** as regras exigem exatamente `direct_<uidA>_<uidB>`, sem `_` dentro dos uids, com dois uids diferentes e ordenados; o usuário autenticado deve ser um deles.
 - **Grupos:** só integrantes leem; só o proprietário gerencia; limite validado nas regras.
-- **Tokens de dispositivos:** legíveis apenas pelo dono; removidos no logout.
+- **Tokens de dispositivos:** legíveis apenas pelo dono; todos os caminhos de logout tentam remover o aparelho antes de encerrar a sessão. Falha gera aviso no log; a espera é limitada a 3 segundos para permitir logout offline. Nesse caso a exclusão do token pode não ser confirmada. Resultados de registro cancelado não substituem a referência da sessão atual.
 - **Dados cadastrais:** `users/{uid}` só é lido pelo próprio dono. Perfis de terceiros passam pela API, que confere se existe conversa/grupo em comum. A lista de usuários usa `publicProfiles` (só nome e foto).
-- **Usuário removido de grupo:** perde a leitura do grupo no Firestore e, após a sincronização, do espelho no RTDB, deixando de ler e enviar mensagens novas.
+- **Usuário removido de grupo:** perde a leitura do grupo no Firestore; o listener do app é encerrado ao perder a participação. O app só confirma a alteração após sincronizar o RTDB, com até três tentativas curtas; se todas falharem, informa que a revogação não foi confirmada. Após sync confirmado, o removido deixa de ler e enviar mensagens novas no RTDB.
 
 **Decisão documentada:** as regras do Realtime Database não conseguem consultar o Firestore. Por isso a API (Admin SDK) espelha os integrantes do grupo em `conversationMembers/{groupId}`, que o app não pode gravar, e faz as validações que cruzam os dois bancos (push, perfis).
+
+O espelho mantém o mapa plano `{ uid: true }` e guarda a versão em `_version`, chave reservada que não é UID gerado por autenticação de e-mail/senha. As regras conferem `child(uid) === true`; a versão numérica não concede acesso. A API usa transação no RTDB e só aplica uma versão mais nova (ausente = -1); `updatedAt` nunca pode regredir no Firestore e alterações de integrantes exigem incremento. Assim, uma sincronização atrasada da API versionada não restaura acesso removido. O processamento de push de grupo também repara o espelho. Os dois bancos não têm commit atômico: se a API estiver indisponível após a alteração no Firestore, o espelho anterior pode persistir até uma sincronização bem-sucedida; o app não apresenta essa revogação como confirmada.
+
+O mapa plano funciona com regras antigas e atuais; espelhos legados sem `_version` também continuam funcionando e recebem a versão no próximo sync. Publicar as regras primeiro preserva o acesso com a API antiga, mas a proteção monotônica contra corrida só existe na API versionada.
 
 Credenciais administrativas existem **somente** nas variáveis da Vercel. `firebaseConfig.json` contém apenas a configuração do SDK cliente, e o `.gitignore` bloqueia `.env`, `serviceAccountKey*.json` e chaves `*-firebase-adminsdk-*.json`.
 
@@ -294,6 +304,8 @@ Push real entregue pela API (FCM) com o app em segundo plano; ao tocar na notifi
 ---
 
 ## ✅ Qualidade
+
+Os testes do app ficam em `server/src/tests/app/` e usam o runner do servidor (`cd server && npm test`), pois o app não possui runner próprio; nenhuma dependência adicional é necessária.
 
 ```bash
 npm run typecheck      # tsc --noEmit (app)
