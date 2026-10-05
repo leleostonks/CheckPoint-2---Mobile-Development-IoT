@@ -25,8 +25,8 @@ async function form() {
         get: async () => ({ exists: () => true, data: () => stored }), update: (_ref, changes) => { stored = { ...stored, ...changes }; },
       }),
     },
-    '/firebase': { firestore: {} }, '/imageService': {}, '/apiClient': { parseOk: () => true, apiRequest: async (path: string, options: { body?: { memberIds: string[] } }) => {
-      if (path.endsWith('/remove-members')) stored = { ...stored, memberIds: stored.memberIds.filter((id) => !options.body?.memberIds.includes(id)), updatedAt: Math.max(Date.now(), stored.updatedAt + 1) };
+    '/firebase': { firestore: {} }, '/imageService': {}, '/apiClient': { parseOk: () => true, apiRequest: async (path: string, options: { body?: { memberIds: string[]; addMemberIds?: string[]; memberLimit?: number } }) => {
+      if (path.endsWith('/remove-members')) stored = { ...stored, memberIds: [...new Set([...stored.memberIds.filter((id) => !options.body?.memberIds.includes(id)), ...(options.body?.addMemberIds ?? [])])], memberLimit: options.body?.memberLimit ?? stored.memberLimit, updatedAt: Math.max(Date.now(), stored.updatedAt + 1) };
       return true;
     } },
   });

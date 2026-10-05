@@ -74,11 +74,11 @@ export function subscribeGroup(
  * Pede à API a remoção segura ou o espelhamento de integrantes no Realtime Database.
  * As regras do Realtime Database usam esse espelho para autorizar leitura e envio de mensagens.
  */
-async function requestGroupChange(groupId: string, operation: 'sync-members' | 'remove-members', memberIds?: readonly string[]): Promise<void> {
+async function requestGroupChange(groupId: string, operation: 'sync-members' | 'remove-members', memberIds?: readonly string[], changes?: Pick<UpdateGroupInput, 'addMemberIds' | 'memberLimit'>): Promise<void> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       await apiRequest(`/groups/${encodeURIComponent(groupId)}/${operation}`, {
-        method: 'POST', timeoutMs: 5000, ...(memberIds ? { body: { memberIds } } : {}),
+        method: 'POST', timeoutMs: 5000, ...(memberIds ? { body: { memberIds, ...changes } } : {}),
       }, parseOk);
       return;
     } catch {
@@ -144,8 +144,9 @@ export async function updateGroup(
   assertValid(validateGroupName(input.name));
   const photoUrl = newPhoto ? await uploadImage(newPhoto, 'groups') : null;
 
-  // A API fecha o RTDB antes de remover no Firestore. O cliente só adiciona/edita depois disso.
-  if (input.removeMemberIds.length) await requestGroupChange(groupId, 'remove-members', input.removeMemberIds);
+  // Com remoções, a API fecha o RTDB e aplica integrantes/limite juntos; o cliente só edita metadados.
+  const hasRemovals = input.removeMemberIds.length > 0;
+  if (hasRemovals) await requestGroupChange(groupId, 'remove-members', input.removeMemberIds, { addMemberIds: input.addMemberIds, memberLimit: input.memberLimit });
 
   await runTransaction(firestore, async (transaction) => {
     const snapshot = await transaction.get(groupDoc(groupId));
@@ -157,22 +158,22 @@ export async function updateGroup(
       throw new AppError('Somente o proprietário pode alterar o grupo.');
     }
 
-    const memberIds = applyMemberChanges(group.memberIds, input.addMemberIds, []);
+    const memberIds = hasRemovals ? group.memberIds : applyMemberChanges(group.memberIds, input.addMemberIds, []);
+    const memberLimit = hasRemovals ? group.memberLimit : input.memberLimit;
     const addedCount = memberIds.filter((id) => !group.memberIds.includes(id)).length;
 
-    if (addedCount > 0 && memberIds.length > input.memberLimit) {
-      const slots = Math.max(0, input.memberLimit - (memberIds.length - addedCount));
+    if (addedCount > 0 && memberIds.length > memberLimit) {
+      const slots = Math.max(0, memberLimit - (memberIds.length - addedCount));
       throw new AppError(
         slots === 0 ? 'O grupo atingiu o limite de integrantes.' : `O grupo só tem ${slots} vaga(s) disponível(is).`,
       );
     }
     assertValid(validateMemberCount(memberIds.length));
-    assertValid(validateMemberLimit(input.memberLimit, memberIds.length));
+    assertValid(validateMemberLimit(memberLimit, memberIds.length));
 
     const changes: Partial<GroupDocument> = {
       name: input.name.trim(),
-      memberIds,
-      memberLimit: input.memberLimit,
+      ...(hasRemovals ? {} : { memberIds, memberLimit }),
       notificationPolicy: input.notificationPolicy,
       updatedBy: currentUid,
       updatedAt: Math.max(Date.now(), group.updatedAt + 1),

@@ -35,26 +35,37 @@ groupsRouter.post('/groups/:groupId/sync-members', authenticate, async (req, res
   res.json({ ok: true, members: group.memberIds.length });
 });
 
-const removalSchema = z.object({ memberIds: z.array(firebaseKeySchema).min(1).max(100) });
+const removalSchema = z.object({
+  memberIds: z.array(firebaseKeySchema).min(1).max(100),
+  addMemberIds: z.array(firebaseKeySchema).max(100).default([]),
+  memberLimit: z.number().optional(),
+});
 
-function validateRemoval(group: GroupRecord, uid: string, memberIds: string[]): string[] {
+function validateMembershipChange(group: GroupRecord, uid: string, removeMemberIds: string[], addMemberIds: string[], requestedLimit?: number): { memberIds: string[]; memberLimit: number } {
   if (group.ownerId !== uid) throw new HttpError(403, 'Somente o proprietário pode remover integrantes.');
-  if (memberIds.includes(group.ownerId)) throw new HttpError(400, 'O proprietário não pode ser removido do grupo.');
-  const remaining = group.memberIds.filter((memberId) => !memberIds.includes(memberId));
-  if (remaining.length < 2) throw new HttpError(400, 'O grupo precisa ter pelo menos dois integrantes.');
-  return remaining;
+  if (removeMemberIds.includes(group.ownerId)) throw new HttpError(400, 'O proprietário não pode ser removido do grupo.');
+  const memberIds = [...new Set([...group.memberIds.filter((memberId) => !removeMemberIds.includes(memberId)), ...addMemberIds])];
+  const memberLimit = requestedLimit ?? group.memberLimit;
+  // O mínimo e a capacidade valem para a seleção final, permitindo substituição sem estado intermediário.
+  if (memberIds.length < 2) throw new HttpError(400, 'O grupo precisa ter pelo menos dois integrantes.');
+  if (!memberIds.includes(group.ownerId)) throw new HttpError(400, 'O proprietário precisa permanecer no grupo.');
+  if (!Number.isInteger(memberLimit) || memberLimit < 2 || memberLimit > 100) throw new HttpError(400, 'O limite precisa ser um inteiro entre 2 e 100.');
+  if (memberIds.length > memberLimit) throw new HttpError(400, 'O limite não pode ser menor que a quantidade final de integrantes.');
+  return { memberIds, memberLimit };
 }
 
 /** Remoção é exclusiva da API: primeiro fecha RTDB, depois confirma Firestore e sincroniza a versão. */
 groupsRouter.post('/groups/:groupId/remove-members', authenticate, async (req, res) => {
   const uid = getAuthenticatedUid(res);
   const groupId = firebaseKeySchema.parse(req.params.groupId);
-  const memberIds = [...new Set(removalSchema.parse(req.body).memberIds)];
+  const input = removalSchema.parse(req.body);
+  const memberIds = [...new Set(input.memberIds)];
+  const addMemberIds = [...new Set(input.addMemberIds)];
   const group = await loadGroup(groupId);
   if (!group) throw new HttpError(404, 'Grupo não encontrado.');
-  validateRemoval(group, uid, memberIds);
+  validateMembershipChange(group, uid, memberIds, addMemberIds, input.memberLimit);
   // Chaves reservadas não são integrantes; nunca as usamos como entradas de remoção.
-  if (memberIds.some((memberId) => memberId.startsWith('_'))) throw new HttpError(400, 'Identificador de integrante inválido.');
+  if ([...memberIds, ...addMemberIds].some((memberId) => memberId.startsWith('_'))) throw new HttpError(400, 'Identificador de integrante inválido.');
 
   const operationId = randomUUID();
   await revokeMembershipMirror(group, memberIds, operationId);
@@ -65,8 +76,12 @@ groupsRouter.post('/groups/:groupId/remove-members', authenticate, async (req, r
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) throw new HttpError(404, 'Grupo não encontrado.');
       const current = { id: groupId, ...groupDocumentSchema.parse(snapshot.data()) };
-      const remaining = validateRemoval(current, uid, memberIds);
-      const changes = { memberIds: remaining, updatedBy: uid, updatedAt: Math.max(Date.now(), current.updatedAt + 1) };
+      const membership = validateMembershipChange(current, uid, memberIds, addMemberIds, input.memberLimit);
+      // A seleção do app vem de publicProfiles; o Admin também confere os novos integrantes no mesmo commit.
+      const added = membership.memberIds.filter((memberId) => !current.memberIds.includes(memberId));
+      const profiles = await Promise.all(added.map((memberId) => transaction.get(db.collection('publicProfiles').doc(memberId))));
+      if (profiles.some((profile) => !profile.exists)) throw new HttpError(400, 'Integrante selecionado não encontrado.');
+      const changes = { ...membership, updatedBy: uid, updatedAt: Math.max(Date.now(), current.updatedAt + 1) };
       transaction.update(ref, changes);
       // Prova privada no mesmo commit: permite limpar esta operação mesmo se o sync final falhar.
       transaction.set(db.collection('membershipRemovals').doc(operationId), { groupId, updatedAt: changes.updatedAt });

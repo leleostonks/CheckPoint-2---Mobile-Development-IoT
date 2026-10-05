@@ -18,11 +18,11 @@ export async function callGroupSync(groupId: string, uid: string): Promise<void>
 }
 
 /** Executa a remoção real com contexto autenticado sintético, como os testes de sync. */
-export async function callGroupRemove(groupId: string, uid: string, memberIds: string[]): Promise<void> {
+export async function callGroupRemove(groupId: string, uid: string, memberIds: string[], changes?: { addMemberIds?: string[]; memberLimit?: number }): Promise<void> {
   const stack = groupsRouter.stack as unknown as { route?: { path: string; stack: { handle: RequestHandler }[] } }[];
   const layer = stack.find((item) => item.route?.path === '/groups/:groupId/remove-members');
   if (!layer?.route) throw new Error('Rota de remoção não encontrada.');
-  await layer.route.stack[1].handle({ params: { groupId }, body: { memberIds } } as unknown as Request, {
+  await layer.route.stack[1].handle({ params: { groupId }, body: { memberIds, ...changes } } as unknown as Request, {
     locals: { uid }, json: () => undefined,
   } as unknown as Response, () => undefined);
 }

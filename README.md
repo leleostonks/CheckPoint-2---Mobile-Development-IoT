@@ -152,7 +152,7 @@ O Firebase Storage exige o plano Blaze (cartão de crédito) em projetos novos, 
 | GET | `/health` | — | Health check: `status`, horário e se Firebase/Cloudinary estão configurados (sem expor valores). |
 | POST | `/notifications/messages` | Bearer ID token | Body `{ conversationId, messageId }`. Valida, calcula destinatários e envia o push. Idempotente. |
 | POST | `/groups/:groupId/sync-members` | Bearer ID token | Espelha os integrantes do Firestore em `conversationMembers/{groupId}` (RTDB). |
-| POST | `/groups/:groupId/remove-members` | Bearer ID token | Body `{ memberIds }`. Somente o proprietário; pré-revoga RTDB, remove no Firestore e sincroniza. Preserva o proprietário e pelo menos dois integrantes. |
+| POST | `/groups/:groupId/remove-members` | Bearer ID token | Body `{ memberIds, addMemberIds?, memberLimit? }` (`memberIds` são as remoções). Somente o proprietário; pré-revoga RTDB, aplica o conjunto final e limite em uma transação Firestore e sincroniza. Preserva o proprietário e pelo menos dois integrantes. |
 | GET | `/profiles/:uid` | Bearer ID token | Dados cadastrais, somente se houver conversa individual ou grupo em comum. |
 | POST | `/uploads/signature` | Bearer ID token | Assinatura de upload do Cloudinary (`{ folder: "profiles" \| "groups" }`). |
 
@@ -203,7 +203,7 @@ cd server
 npm install
 cp .env.example .env   # preencha com valores reais (arquivo ignorado pelo git)
 npm run dev            # http://localhost:3000
-npm test               # 46 testes: políticas, push, sincronização, formulário, listener, logout e tipos
+npm test               # 48 testes: políticas, push, sincronização, formulário, listener, logout e tipos
 ```
 
 ---
@@ -263,7 +263,7 @@ Regras gerais, aplicadas na API ([`recipientResolver.ts`](server/src/services/re
 
 - `memberLimit` é definido na criação (inteiro de 2 a 100, **incluindo o proprietário**) e pode ser alterado pelo proprietário.
 - A interface mostra a quantidade atual e as **vagas disponíveis**, e impede selecionar além do limite.
-- O `groupService` solicita remoções pela API antes da **transação do Firestore** para adições e demais mudanças. Ambas as transações leem o estado mais recente e validam os limites; remoções mantêm no mínimo dois integrantes. Adições só ganham acesso ao RTDB após sincronização.
+- Quando há remoções, o `groupService` envia remoções, adições e limite à API, que valida o conjunto final e o grava em uma **transação do Firestore**; depois o SDK altera somente nome, política e foto. Isso permite substituir um integrante num grupo com limite de dois. Sem remoções, adições e demais mudanças continuam em transação pelo SDK. As transações leem o estado mais recente; adições só ganham acesso ao RTDB após sincronização.
 - O formulário envia somente adições/remoções em relação à seleção que tinha ao abrir. Salvar só o nome preserva integrantes adicionados em outra sessão; a transação aplica a intenção do usuário sobre o grupo atual.
 - **As regras do Firestore repetem a validação no servidor:** `memberIds.size() <= memberLimit`, `memberLimit >= memberIds.size()`, sem duplicados, somente o proprietário altera. As regras avaliam o documento **resultante** de cada escrita, e o Firestore serializa escritas concorrentes no mesmo documento. Por isso duas entradas simultâneas nunca ultrapassam o limite, mesmo vindas de um cliente modificado.
 
@@ -272,7 +272,7 @@ Isso é comprovado por um teste automatizado nos emuladores. Com 1 vaga e 2 entr
 ```bash
 cd firebase/tests
 npm install
-npm test        # requer Java 21+ (emuladores do Firebase) — 48 testes das regras, remoção e sincronização
+npm test        # requer Java 21+ (emuladores do Firebase) — 55 testes das regras, remoção e sincronização
 ```
 
 ---

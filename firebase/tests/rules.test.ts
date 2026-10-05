@@ -16,6 +16,7 @@ import 'firebase/compat/firestore';
 
 import { adminDatabase, adminFirestore } from '../../server/src/services/firebaseAdmin';
 import { callGroupRemove, callGroupSync, initializeDemoAdmin } from '../../server/src/tests/groupRoute';
+import { loadWithMocks } from '../../server/src/tests/modules';
 
 const PROJECT = join(__dirname, '..');
 let env: RulesTestEnvironment;
@@ -245,6 +246,103 @@ describe('Realtime Database: mensagens', () => {
 
   it('alteração de integrantes exige uma versão mais nova', async () => {
     await assertFails(fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now }));
+  });
+});
+
+describe('C01: edição do conjunto final de integrantes pela API', () => {
+  const badRequest = (error: unknown) => typeof error === 'object' && error !== null && 'status' in error && error.status === 400;
+
+  it('troca Bob por Carol no mínimo/limite 2 pelo serviço real e pré-revoga antes do commit', async () => {
+    const owner = fs('alice'); const ref = owner.doc('groups/g1');
+    await ref.update({ memberLimit: 2 }); await callGroupSync('g1', 'alice');
+    const reference = { withConverter: () => reference }; let clientTransactions = 0;
+    const service = loadWithMocks<typeof import('../../src/services/groupService')>(join(__dirname, '../../src/services/groupService.ts'), {
+      'firebase/firestore': {
+        collection: () => reference, doc: () => reference,
+        runTransaction: async (_db: unknown, action: (transaction: {
+          get: () => Promise<{ exists: () => boolean; data: () => Record<string, unknown> }>;
+          update: (_ref: unknown, changes: Record<string, unknown>) => void;
+        }) => Promise<void>) => { clientTransactions++; return owner.runTransaction(async (transaction) => action({
+          get: async () => { const snapshot = await transaction.get(ref); const data: Record<string, unknown> = snapshot.data() ?? {}; return { exists: () => snapshot.exists, data: () => ({ id: 'g1', ...data }) }; },
+          update: (_ref, changes) => { assert.equal('memberIds' in changes, false); assert.equal('memberLimit' in changes, false); transaction.update(ref, changes); },
+        })); },
+      },
+      '/firebase': { firestore: {} }, '/imageService': {},
+      '/apiClient': { parseOk: () => true, apiRequest: async (route: string, options: { body?: { memberIds: string[]; addMemberIds?: string[]; memberLimit?: number } }) => {
+        if (route === '/groups/g1/remove-members') {
+          assert.ok(options.body); await callGroupRemove('g1', 'alice', options.body.memberIds, options.body);
+        } else { assert.equal(route, '/groups/g1/sync-members'); await callGroupSync('g1', 'alice'); }
+        return true;
+      } },
+    });
+    const database = adminFirestore(); const original = database.runTransaction.bind(database); let checked = false;
+    const patched = mock.method(database, 'runTransaction', async (...args: Parameters<typeof database.runTransaction>) => {
+      assert.deepEqual((await ref.get()).get('memberIds'), ['alice', 'bob']);
+      await assertFails(db('bob').ref('messages/g1').get());
+      await assertFails(db('bob').ref('messages/g1/c01-before').set(message({ senderId: 'bob' })));
+      await assertFails(db('carol').ref('messages/g1').get());
+      checked = true; return original(...args);
+    });
+    try { await service.updateGroup('g1', 'alice', { name: 'Troca válida', memberLimit: 2, notificationPolicy: 'mentioned_members', addMemberIds: ['carol'], removeMemberIds: ['bob'] }, null); }
+    finally { patched.mock.restore(); }
+    assert.equal(checked, true); assert.equal(clientTransactions, 1);
+    const final = await ref.get(); assert.deepEqual(final.get('memberIds'), ['alice', 'carol']); assert.equal(final.get('memberLimit'), 2);
+    assert.equal(final.get('name'), 'Troca válida'); assert.equal(final.get('notificationPolicy'), 'mentioned_members');
+    await assertFails(db('bob').ref('messages/g1').get());
+    await assertFails(db('bob').ref('messages/g1/c01-after').set(message({ senderId: 'bob' })));
+    await assertSucceeds(db('carol').ref('messages/g1').get());
+    await assertSucceeds(db('carol').ref('messages/g1/c01-new').set(message({ senderId: 'carol' })));
+  });
+
+  it('troca e aumenta limite para adicionar dois integrantes no mesmo commit', async () => {
+    await fs('alice').doc('groups/g1').update({ memberLimit: 2 }); await callGroupSync('g1', 'alice');
+    await callGroupRemove('g1', 'alice', ['bob'], { addMemberIds: ['carol', 'dave'], memberLimit: 3 });
+    const final = await fs('alice').doc('groups/g1').get();
+    assert.deepEqual(final.get('memberIds'), ['alice', 'carol', 'dave']); assert.equal(final.get('memberLimit'), 3);
+    await assertFails(db('bob').ref('messages/g1').get());
+    await assertSucceeds(db('carol').ref('messages/g1').get()); await assertSucceeds(db('dave').ref('messages/g1').get());
+  });
+
+  it('limite menor que o conjunto final retorna 400 sem alterar o grupo', async () => {
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupSync('g1', 'alice');
+    await assert.rejects(callGroupRemove('g1', 'alice', ['bob'], { addMemberIds: ['dave'], memberLimit: 2 }), badRequest);
+    assert.deepEqual((await fs('alice').doc('groups/g1').get()).get('memberIds'), ['alice', 'bob', 'carol']);
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+  });
+
+  it('não proprietário recebe 403 mesmo com troca e limite final válidos', async () => {
+    await assert.rejects(callGroupRemove('g1', 'bob', ['bob'], { addMemberIds: ['carol'], memberLimit: 2 }), (error: unknown) => typeof error === 'object' && error !== null && 'status' in error && error.status === 403);
+    assert.deepEqual((await fs('alice').doc('groups/g1').get()).get('memberIds'), ['alice', 'bob']);
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+  });
+
+  it('limite final precisa ser inteiro entre 2 e 100', async () => {
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    for (const memberLimit of [1, 2.5, 101]) await assert.rejects(callGroupRemove('g1', 'alice', ['bob'], { memberLimit }), badRequest);
+    assert.deepEqual((await fs('alice').doc('groups/g1').get()).get('memberIds'), ['alice', 'bob', 'carol']);
+  });
+
+  it('adicionado inexistente é recusado e rollback preserva o integrante original', async () => {
+    await fs('alice').doc('groups/g1').update({ memberIds: ['alice', 'bob', 'carol'], updatedBy: 'alice', updatedAt: now + 1 });
+    await callGroupSync('g1', 'alice');
+    await assert.rejects(callGroupRemove('g1', 'alice', ['bob'], { addMemberIds: ['ghost'], memberLimit: 3 }), badRequest);
+    assert.deepEqual((await fs('alice').doc('groups/g1').get()).get('memberIds'), ['alice', 'bob', 'carol']);
+    await assertSucceeds(db('bob').ref('messages/g1').get());
+    await assertSucceeds(db('bob').ref('messages/g1/c01-rollback').set(message({ senderId: 'bob' })));
+    assert.equal((await db('alice').ref('conversationMembers/g1/_removals').get()).exists(), false);
+  });
+
+  it('duas trocas concorrentes não ultrapassam o limite final', async () => {
+    await fs('alice').doc('groups/g1').update({ memberLimit: 2 }); await callGroupSync('g1', 'alice');
+    const results = await Promise.allSettled(['carol', 'dave'].map((uid) => callGroupRemove('g1', 'alice', ['bob'], { addMemberIds: [uid], memberLimit: 2 })));
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    const ids: string[] = (await fs('alice').doc('groups/g1').get()).get('memberIds'); assert.equal(ids.length, 2); assert.ok(ids.includes('alice'));
+    await assertFails(db('bob').ref('messages/g1').get());
+    for (const uid of ['carol', 'dave']) {
+      if (ids.includes(uid)) await assertSucceeds(db(uid).ref('messages/g1').get());
+      else await assertFails(db(uid).ref('messages/g1').get());
+    }
   });
 });
 
